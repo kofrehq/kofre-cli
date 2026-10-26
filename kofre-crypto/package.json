@@ -1,0 +1,26 @@
+{
+  "name": "@kofre/crypto",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@noble/ciphers": "^1.3.0",
+    "@noble/curves": "^1.9.7",
+    "@noble/hashes": "^1.8.0",
+    "hash-wasm": "^4.12.0"
+  },
+  "devDependencies": {
+    "tweetnacl": "^1.0.3",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  }
+}

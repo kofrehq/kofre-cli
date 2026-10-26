@@ -1,0 +1,3 @@
+packages:
+  - "kofre-crypto"
+  - "kofre-cli"

@@ -1,0 +1,7 @@
+{
+  "main": "dist/kofre.js",
+  "output": "dist/sea-prep.blob",
+  "disableExperimentalSEAWarning": true,
+  "useCodeCache": true,
+  "assets": { "ui.mjs": "dist/ui.mjs" }
+}

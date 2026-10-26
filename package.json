@@ -1,0 +1,13 @@
+{
+  "name": "kofre-cli",
+  "private": true,
+  "packageManager": "pnpm@10.18.0",
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild"]
+  },
+  "scripts": {
+    "test": "pnpm -r --if-present test",
+    "typecheck": "pnpm -r --if-present typecheck",
+    "build": "pnpm -r --if-present build"
+  }
+}
