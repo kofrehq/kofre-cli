@@ -4,11 +4,24 @@ import { basename, join } from "node:path";
 import { parse } from "dotenv";
 
 export const SECRET_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/**
+ * Nombres que cambian cómo arranca un proceso: inyectados en `kofre run` ejecutarían código de quien los escribió en la
+ * máquina de cualquier miembro. Se rechazan al guardar y se descartan al inyectar. La API aplica la misma lista.
+ */
+export const RESERVED_NAMES = new Set([
+  "PATH", "PATHEXT", "COMSPEC", "SYSTEMROOT", "WINDIR", "NODE_OPTIONS", "NODE_PATH", "NODE_EXTRA_CA_CERTS", "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",
+  "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "BASH_ENV", "ENV", "ZDOTDIR", "PROMPT_COMMAND", "PYTHONPATH", "PYTHONSTARTUP", "PERL5OPT", "PERL5LIB",
+  "RUBYOPT", "RUBYLIB", "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "GIT_SSH_COMMAND", "GIT_EXEC_PATH", "GIT_CONFIG_GLOBAL", "NPM_CONFIG_SCRIPT_SHELL", "SHELL",
+  "KOFRE_PASSWORD", "KOFRE_TOKEN", "KOFRE_HOME", "KOFRE_API_URL", "KOFRE_VAULT_FILE",
+]);
+export const isReservedName = (name: string) => RESERVED_NAMES.has(name.toUpperCase());
 export const MAX_VALUE_BYTES = 48 * 1024;
 
 export function parseEnvFile(text: string): Record<string, string> {
   const values = parse(text);
   const invalid = Object.keys(values).filter((key) => !SECRET_NAME.test(key));
+  const reserved = Object.keys(values).filter(isReservedName);
+  if (reserved.length) throw new Error(`${reserved.join(", ")}: no puede guardarse, cambia cómo arranca un proceso y ejecutaría código ajeno en cada máquina.`);
   if (invalid.length > 0) {
     throw new Error(`Nombres de variable no válidos: ${invalid.join(", ")}. Usa letras, dígitos y guion bajo.`);
   }

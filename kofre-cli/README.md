@@ -36,11 +36,14 @@ kofre sync github --env prod --environment production   # secretos de Actions, s
 Agentes de IA (Claude Code, Cursor, Claude Desktop):
 
 ```bash
-kofre guard    # ignora los .env, bloquea su lectura al agente y registra el servidor MCP
-kofre unlock   # deja la clave en el llavero para que el agente no pida la contraseña
-kofre scan     # .env fuera de .gitignore y credenciales en claro en configs de agentes
+kofre guard              # ignora los .env, bloquea su lectura al agente y registra el servidor MCP
+kofre unlock --env dev   # abre solo dev para el agente: prod sigue cerrado aunque lo pida
+kofre unlock             # abre todo (deja la clave privada en el llavero 12 h)
+kofre scan               # .env fuera de .gitignore y credenciales en claro en configs de agentes
 ```
 
-`kofre mcp` es un servidor MCP por stdio: el agente ve nombres de variables, ejecuta comandos con las variables inyectadas (`kofre_run`, con los valores tachados en la salida) y guarda credenciales nuevas cifradas (`kofre_set`). Ninguna herramienta devuelve valores.
+`kofre mcp` es un servidor MCP por stdio: el agente ve nombres de variables, ejecuta comandos con las variables inyectadas (`kofre_run`, con los valores tachados en la salida, también en base64, hex, URL y JSON) y guarda credenciales nuevas cifradas (`kofre_set`). Ninguna herramienta devuelve valores. Ten en cuenta que `kofre_run` ejecuta lo que el agente pida con los secretos del ambiente en el entorno del proceso: desbloquea solo el ambiente que el agente necesite.
+
+Claves públicas confiadas: la CLI fija la clave pública de cada miembro y token la primera vez que confirmas su huella (`kofre members add`, `kofre tokens create`) y se niega a compartir un ambiente con una clave que cambió. `kofre keys list` las muestra y `kofre keys forget <id>` olvida una.
 
 Más comandos: `kofre --help`. Documentación y binarios nativos: https://github.com/kofrehq/kofre-releases

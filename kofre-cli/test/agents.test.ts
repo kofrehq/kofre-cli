@@ -105,3 +105,12 @@ describe("mcp", () => {
     expect(out).toBe("db=postgres://u:[DB_PASS]@h/db port=3000 key=[KEY]");
   });
 });
+
+describe("redact codificado", () => {
+  it("tacha el valor también en base64, hex, URL y JSON", async () => {
+    const { redact } = await import("../src/mcp");
+    const values = { TOKEN: "supersecretvalue123", DB: "postgres://u:p@h/db" };
+    const text = [Buffer.from(values.TOKEN).toString("base64"), Buffer.from(values.TOKEN).toString("hex"), encodeURIComponent(values.DB), JSON.stringify(values.DB)].join(" ");
+    expect(redact(text, values)).toBe('[TOKEN] [TOKEN] [DB] "[DB]"');
+  });
+});

@@ -1,5 +1,6 @@
-import { decryptSecret, encryptSecret, openSealedEnvKey } from "@kofre/crypto";
-import { ApiError, api, requireSession, vaultKey } from "./config";
+import { b64ToBytes, decryptSecret, encryptSecret, openSealedEnvKey } from "@kofre/crypto";
+import { ApiError, api, requireSession, serviceToken, vaultKey } from "./config";
+import { readEnvKeys, readVaultKey } from "./vault-store";
 import { readTomlProject } from "./envfile";
 import { isNetworkError, readCache, saveCache } from "./offline";
 
@@ -38,10 +39,22 @@ export async function environmentFor(slug?: string) {
   return { project, environment };
 }
 
-export async function envKeyFor(environment: EnvironmentRow): Promise<Uint8Array> {
+export const envCacheKey = (projectId: string, slug: string) => `${projectId}:${slug}`;
+
+/**
+ * Clave del ambiente: con la clave privada (token de servicio o bóveda abierta) se abre la clave sellada, ligada a
+ * proyecto y slug; si solo se desbloqueó este ambiente (kofre unlock --env), se usa la copia del llavero; si no, se
+ * pide la contraseña.
+ */
+export async function envKeyFor(environment: EnvironmentRow, projectId: string): Promise<Uint8Array> {
+  const scope = { projectId, slug: environment.slug };
+  if (!serviceToken() && !readVaultKey()) {
+    const cached = readEnvKeys()[envCacheKey(projectId, environment.slug)];
+    if (cached) return b64ToBytes(cached);
+  }
   const wrap = environment.keyWraps[0]?.ciphertext;
   if (!wrap) throw new Error("Este ambiente no tiene clave envuelta para tu usuario.");
-  return openSealedEnvKey(wrap, await vaultKey());
+  return openSealedEnvKey(wrap, await vaultKey(), scope);
 }
 
 /** Cifra cada valor con la versión que se va a guardar (actual + 1); el servidor rechaza escrituras obsoletas. */
@@ -49,7 +62,7 @@ export async function envKeyFor(environment: EnvironmentRow): Promise<Uint8Array
 export async function writeSecrets(values: Record<string, string>, slug?: string): Promise<{ changed: number; unchanged: number }> {
   const session = requireSession();
   const { project, environment } = await environmentFor(slug);
-  const key = await envKeyFor(environment);
+  const key = await envKeyFor(environment, project.id);
   const current = new Map(
     (await api<SecretRow[]>(`/environments/${environment.id}/secrets`, {}, session.token)).map((row) => [row.name, row]),
   );
@@ -115,7 +128,7 @@ export async function readSecrets(
     environment = cached.environment;
     rows = cached.rows;
   }
-  const key = await envKeyFor(environment);
+  const key = await envKeyFor(environment, project.id);
   const values: Record<string, string> = {};
   for (const row of rows) {
     values[row.name] = decryptSecret(key, row.ciphertext, {

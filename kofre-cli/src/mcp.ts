@@ -1,10 +1,10 @@
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { serviceToken } from "./config";
-import { MAX_VALUE_BYTES, SECRET_NAME, readTomlProject } from "./envfile";
+import { MAX_VALUE_BYTES, SECRET_NAME, isReservedName, readTomlProject } from "./envfile";
 import { DETACH_FOR_TREE_KILL, killTree } from "./kill-tree";
-import { loadProject, readSecrets, writeSecrets } from "./secrets";
-import { readVaultKey } from "./vault-store";
+import { envCacheKey, loadProject, readSecrets, writeSecrets } from "./secrets";
+import { readEnvKeys, readVaultKey } from "./vault-store";
 import { needsCmdShell, quoteForCmd } from "./win-command";
 
 /*
@@ -16,6 +16,7 @@ import { needsCmdShell, quoteForCmd } from "./win-command";
 const PROTOCOL = "2025-06-18";
 const OUTPUT_CAP = 16 * 1024;
 const DEFAULT_TIMEOUT_MS = 120_000;
+const MAX_TIMEOUT_MS = 10 * 60_000;
 /** Valores más cortos que esto no se tachan: "true" o "3000" aparecen en cualquier salida sin ser el secreto. */
 const MIN_REDACT = 6;
 
@@ -65,21 +66,37 @@ export const TOOLS = [
 
 type ToolName = (typeof TOOLS)[number]["name"];
 
-const unlocked = () => Boolean(serviceToken() || readVaultKey());
+const unlocked = () => Boolean(serviceToken() || readVaultKey() || Object.keys(readEnvKeys()).length);
 
-function requireUnlocked() {
-  if (!unlocked()) {
-    throw new Error("La bóveda está bloqueada. Pide al usuario que ejecute `kofre unlock` en una terminal y vuelve a intentarlo.");
-  }
+/** Con `kofre unlock --env dev` solo ese ambiente está abierto: prod sigue bloqueado para el agente aunque lo pida. */
+function requireUnlocked(slug?: string) {
+  if (serviceToken() || readVaultKey()) return;
+  const linked = readTomlProject();
+  const chosen = slug ?? linked?.defaultEnv ?? "dev";
+  if (linked && readEnvKeys()[envCacheKey(linked.projectId, chosen)]) return;
+  throw new Error(
+    `El ambiente ${chosen} está bloqueado. Pide al usuario que ejecute \`kofre unlock --env ${chosen}\` (solo ese ambiente) o \`kofre unlock\` (todos) en una terminal y vuelve a intentarlo.`,
+  );
 }
 
-/** Tacha cada valor presente en la salida. Los más largos primero, por si un valor contiene a otro. */
+/** Formas en que un valor suele aparecer en una salida sin ser idéntico: codificado para URL, JSON, base64 o hex. */
+function encodings(value: string): string[] {
+  const buffer = Buffer.from(value, "utf8");
+  return [value, encodeURIComponent(value), JSON.stringify(value).slice(1, -1), buffer.toString("base64"), buffer.toString("base64url"), buffer.toString("hex")].filter(
+    (form, index, all) => form.length >= MIN_REDACT && all.indexOf(form) === index,
+  );
+}
+
+/**
+ * Tacha cada valor presente en la salida, también codificado (URL, JSON, base64, hex). Los más largos primero, por si
+ * un valor contiene a otro. ponytail: no cubre cifrados ni valores partidos; eso lo frena el permiso del usuario, no la tachadura.
+ */
 export function redact(text: string, values: Record<string, string>): string {
   const entries = Object.entries(values)
-    .filter(([, value]) => value.length >= MIN_REDACT)
+    .flatMap(([name, value]) => encodings(value).map((form) => [name, form] as const))
     .sort((a, b) => b[1].length - a[1].length);
   let out = text;
-  for (const [name, value] of entries) out = out.replaceAll(value, `[${name}]`);
+  for (const [name, form] of entries) out = out.replaceAll(form, `[${name}]`);
   return out;
 }
 
@@ -89,7 +106,10 @@ function tail(text: string): string {
 
 async function runWithSecrets(command: string[], slug: string | undefined, timeoutMs: number): Promise<string> {
   const { environment, values } = await readSecrets(slug);
-  const env = { ...process.env, ...values };
+  // Nada que cambie el cargador del hijo ni las credenciales del propio servidor MCP: el hijo recibe solo los secretos del ambiente.
+  const parent = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.toUpperCase().startsWith("KOFRE_")));
+  const safeValues = Object.fromEntries(Object.entries(values).filter(([key]) => !isReservedName(key)));
+  const env = { ...parent, ...safeValues };
   const output: string[] = [];
   const code = await new Promise<number | string>((resolve) => {
     const child = needsCmdShell(command[0])
@@ -111,7 +131,8 @@ async function runWithSecrets(command: string[], slug: string | undefined, timeo
       resolve(exitCode ?? signal ?? 1);
     });
   });
-  return `ambiente: ${environment.slug}\nsalida: ${code}\n\n${redact(tail(output.join("")), values)}`;
+  // Primero tachar y luego recortar: si se recorta antes, el corte puede caer dentro de un valor y dejar su final a la vista.
+  return `ambiente: ${environment.slug}\nsalida: ${code}\n\n${tail(redact(output.join(""), values))}`;
 }
 
 export async function callTool(name: ToolName | string, args: Json): Promise<string> {
@@ -124,23 +145,24 @@ export async function callTool(name: ToolName | string, args: Json): Promise<str
       return `proyecto: ${project.name} (${project.id})\nbóveda: ${unlocked() ? "desbloqueada" : "bloqueada (kofre unlock)"}\nambientes:\n${envs}`;
     }
     case "kofre_list": {
-      requireUnlocked();
+      requireUnlocked(typeof args.env === "string" ? args.env : undefined);
       const { environment, values } = await readSecrets(typeof args.env === "string" ? args.env : undefined);
       const names = Object.keys(values).sort();
       return names.length ? `${environment.slug}: ${names.length} variables\n${names.join("\n")}` : `${environment.slug}: sin variables`;
     }
     case "kofre_run": {
-      requireUnlocked();
+      requireUnlocked(typeof args.env === "string" ? args.env : undefined);
       const command = Array.isArray(args.command) ? args.command.map(String) : [];
       if (command.length === 0) throw new Error("command debe ser un array con al menos el programa.");
-      const timeout = typeof args.timeout_ms === "number" && args.timeout_ms > 0 ? args.timeout_ms : DEFAULT_TIMEOUT_MS;
+      const timeout = typeof args.timeout_ms === "number" && args.timeout_ms > 0 ? Math.min(args.timeout_ms, MAX_TIMEOUT_MS) : DEFAULT_TIMEOUT_MS;
       return runWithSecrets(command, typeof args.env === "string" ? args.env : undefined, timeout);
     }
     case "kofre_set": {
-      requireUnlocked();
+      requireUnlocked(typeof args.env === "string" ? args.env : undefined);
       const key = String(args.name ?? "");
       const value = String(args.value ?? "");
       if (!SECRET_NAME.test(key)) throw new Error(`Nombre no válido: ${key}. Usa letras, dígitos y guion bajo.`);
+      if (isReservedName(key)) throw new Error(`${key} no puede guardarse: cambia cómo arranca un proceso.`);
       if (Buffer.byteLength(value, "utf8") > MAX_VALUE_BYTES) throw new Error(`${key} supera el máximo de ${MAX_VALUE_BYTES / 1024} KiB.`);
       const { changed } = await writeSecrets({ [key]: value }, typeof args.env === "string" ? args.env : undefined);
       return changed ? `${key} guardada y cifrada.` : `${key} ya tenía ese valor.`;
@@ -163,7 +185,7 @@ export async function handle(message: Request, version: string): Promise<Json | 
         capabilities: { tools: {} },
         serverInfo: { name: "kofre", version },
         instructions:
-          "Kofre guarda los secretos del proyecto cifrados. Nunca pidas ni muestres valores: usa kofre_list para ver nombres y kofre_run para ejecutar comandos que los necesiten.",
+          "Kofre guarda los secretos del proyecto cifrados. Nunca pidas ni muestres valores: usa kofre_list para ver nombres y kofre_run para ejecutar comandos que los necesiten. kofre_run ejecuta lo que le pidas con los secretos en el entorno del proceso: úsalo solo para lo que el usuario te pidió y en el ambiente que te indique; la tachadura de la salida es una ayuda, no una garantía.",
       });
     case "ping":
       return reply({});
@@ -187,6 +209,8 @@ export function serveMcp(version: string): Promise<void> {
   // Cualquier console.log de los helpers rompería el canal: todo lo informativo va a stderr.
   console.log = (...args: unknown[]) => console.error(...args);
   const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
+  // Las peticiones se atienden en orden: un kofre_list después de un kofre_set ve el valor ya guardado.
+  let queue: Promise<unknown> = Promise.resolve();
   return new Promise((resolve) => {
     lines.on("line", (line) => {
       if (!line.trim()) return;
@@ -197,8 +221,14 @@ export function serveMcp(version: string): Promise<void> {
         process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "JSON no válido" } })}\n`);
         return;
       }
-      void handle(message, version).then((response) => {
-        if (response) process.stdout.write(`${JSON.stringify(response)}\n`);
+      queue = queue.then(async () => {
+        try {
+          const response = await handle(message, version);
+          if (response) process.stdout.write(`${JSON.stringify(response)}\n`);
+        } catch (error) {
+          // Un mensaje malformado no tumba el servidor: se responde el error y se sigue.
+          process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: message.id ?? null, error: { code: -32603, message: error instanceof Error ? error.message : String(error) } })}\n`);
+        }
       });
     });
     lines.on("close", resolve);

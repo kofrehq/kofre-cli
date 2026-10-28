@@ -54,6 +54,19 @@ const TYPE_RECOVERY = 4;
 const AAD_WRAP = utf8("kofre|wrap-priv|v1");
 const AAD_RECOVERY = utf8("kofre|recovery|v1");
 const AAD_SEAL = utf8("kofre|env-seal|v1");
+/** Formato 2 de clave de ambiente sellada: la AAD liga la clave al proyecto y al ambiente (slug), más la cabecera. */
+const SEAL_FORMAT_V2 = 2;
+export type EnvScope = { projectId: string; slug: string };
+function sealAad(scope: EnvScope): Uint8Array {
+  if (!scope.projectId || !scope.slug || scope.projectId.includes("|") || scope.slug.includes("|")) throw new Error("Ámbito de ambiente no válido");
+  return utf8(`kofre|env-seal|v2|${scope.projectId}|${scope.slug}`);
+}
+/** Un punto de orden bajo da un secreto compartido todo ceros: se rechaza como hace libsodium. */
+function sharedSecret(privateKey: Uint8Array, publicKey: Uint8Array): Uint8Array {
+  const shared = x25519.getSharedSecret(privateKey, publicKey);
+  if (shared.every((byte) => byte === 0)) throw new Error("Clave pública no válida");
+  return shared;
+}
 
 export type PasswordMaterial = {
   salt: string;
@@ -318,27 +331,48 @@ export function parseServiceToken(text: string): { id: string; secret: Uint8Arra
   return { id: body.slice(0, split), secret, secretHash: bytesToHex(sha256(secret)) };
 }
 
-export function sealEnvKeyForUser(envKey: Uint8Array, recipientPublicKey: Uint8Array): string {
+/**
+ * Sella la clave de un ambiente para una clave pública. Con `scope` (proyecto + slug) usa el formato 2, cuya AAD liga la
+ * clave a ese ambiente: un servidor hostil no puede servir la clave de dev como si fuera la de prod. Sin scope produce el
+ * formato 1 (solo para datos antiguos; los clientes actuales siempre pasan scope).
+ */
+export function sealEnvKeyForUser(envKey: Uint8Array, recipientPublicKey: Uint8Array, scope?: EnvScope): string {
   const ephemeralPrivate = randomBytes(32);
   const ephemeralPublic = x25519.getPublicKey(ephemeralPrivate);
-  const shared = x25519.getSharedSecret(ephemeralPrivate, recipientPublicKey);
+  const shared = sharedSecret(ephemeralPrivate, recipientPublicKey);
   const key = hkdf(sha256, shared, ephemeralPublic, utf8("kofre-seal-v1"), 32);
   const nonce = randomBytes(24);
-  const ciphertext = xchacha20poly1305(key, nonce, AAD_SEAL).encrypt(envKey);
-  return bytesToB64(concat(Uint8Array.of(FORMAT_VERSION, TYPE_ENV_KEY), ephemeralPublic, nonce, ciphertext));
+  const header = Uint8Array.of(scope ? SEAL_FORMAT_V2 : FORMAT_VERSION, TYPE_ENV_KEY);
+  const aad = scope ? concat(header, sealAad(scope)) : AAD_SEAL;
+  const ciphertext = xchacha20poly1305(key, nonce, aad).encrypt(envKey);
+  return bytesToB64(concat(header, ephemeralPublic, nonce, ciphertext));
 }
 
-export function openSealedEnvKey(blob: string, recipientPrivateKey: Uint8Array): Uint8Array {
+/** Formato 1: sellada sin ligar al ambiente. Conviene rotar el ambiente para pasar al formato 2. */
+export function isLegacyEnvKeyWrap(blob: string): boolean {
   const raw = b64ToBytes(blob);
-  if (raw[0] !== FORMAT_VERSION || raw[1] !== TYPE_ENV_KEY) {
+  return raw[0] === FORMAT_VERSION && raw[1] === TYPE_ENV_KEY;
+}
+
+export function openSealedEnvKey(blob: string, recipientPrivateKey: Uint8Array, scope?: EnvScope): Uint8Array {
+  const raw = b64ToBytes(blob);
+  const header = raw.slice(0, 2);
+  if ((header[0] !== FORMAT_VERSION && header[0] !== SEAL_FORMAT_V2) || header[1] !== TYPE_ENV_KEY) {
     throw new Error("Formato de clave de ambiente no reconocido");
   }
+  if (header[0] === SEAL_FORMAT_V2 && !scope) throw new Error("Esta clave de ambiente está ligada a un proyecto y ambiente: falta el ámbito");
   const ephemeralPublic = raw.slice(2, 34);
   const nonce = raw.slice(34, 58);
   const ciphertext = raw.slice(58);
-  const shared = x25519.getSharedSecret(recipientPrivateKey, ephemeralPublic);
+  const shared = sharedSecret(recipientPrivateKey, ephemeralPublic);
   const key = hkdf(sha256, shared, ephemeralPublic, utf8("kofre-seal-v1"), 32);
-  return xchacha20poly1305(key, nonce, AAD_SEAL).decrypt(ciphertext);
+  const aad = header[0] === SEAL_FORMAT_V2 ? concat(header, sealAad(scope!)) : AAD_SEAL;
+  return xchacha20poly1305(key, nonce, aad).decrypt(ciphertext);
+}
+
+/** Clave pública de una privada X25519: para comprobar que la clave que el servidor dice que es tuya lo es. */
+export function publicKeyOf(privateKey: Uint8Array): Uint8Array {
+  return x25519.getPublicKey(privateKey);
 }
 
 export type SecretMeta = { projectId: string; environmentId: string; name: string; version: number };

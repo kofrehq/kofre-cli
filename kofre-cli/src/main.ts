@@ -1,17 +1,20 @@
+import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { Command, CommanderError } from "commander";
 import {
   b64ToBytes,
+  bytesToB64,
   decryptSecret,
   encryptSecret,
   generateEnvKey,
   openSealedEnvKey,
+  publicKeyOf,
   sealEnvKeyForUser,
 } from "@kofre/crypto";
 import { ApiError, api, clearSession, readSession, requireSession, revokeSession, serviceToken, vaultKey } from "./config";
 import { loginWithBrowser } from "./cli-login";
-import { MAX_VALUE_BYTES, SECRET_NAME, gitignoreWarns, kofreHeader, parseEnvFile, readTomlProject, serializeEnv, tomlFor } from "./envfile";
+import { MAX_VALUE_BYTES, SECRET_NAME, gitignoreWarns, kofreHeader, parseEnvFile, readTomlProject, serializeEnv, tomlFor, isReservedName } from "./envfile";
 import { choosePullTarget } from "./pull-target";
 import { isNetworkError, readCache, saveCache } from "./offline";
 import { promptHidden } from "./prompt";
@@ -21,7 +24,8 @@ import { envKeyFor, environmentFor, loadProject, readSecrets, writeSecrets, type
 import { notifyUpdate } from "./update-check";
 import { isPatchedNode } from "./node-version";
 import { needsCmdShell, quoteForCmd } from "./win-command";
-import { listMembers, listTokens, rotateEnvironment, wrapsForMembers } from "./sharing";
+import { listMembers, listTokens, rotateEnvironment, wrapsForMembers, memberPrincipals } from "./sharing";
+import { forgetKey, listKeys, pinKey, verifyPrincipals } from "./known-keys";
 import { createServiceTokenMaterial, fingerprint, formatServiceToken } from "@kofre/crypto";
 
 declare const __KOFRE_VERSION__: string | undefined;
@@ -68,9 +72,29 @@ program
 program
   .command("unlock")
   .description("Pide la contraseña maestra y deja la clave en el llavero; así `kofre mcp` y los agentes no la necesitan")
-  .action(async () => {
-    await vaultKey();
-    console.log(`Bóveda desbloqueada durante ${process.env.KOFRE_VAULT_TTL_MIN ?? 720} minutos.`);
+  .option("--env <slugs>", "solo estos ambientes del proyecto vinculado (separados por coma): la clave privada no se guarda y un agente no alcanza los demás, por ejemplo prod")
+  .action(async (opts: { env?: string }) => {
+    const minutes = process.env.KOFRE_VAULT_TTL_MIN ?? 720;
+    if (!opts.env) {
+      await vaultKey({ persist: true });
+      console.log(`Bóveda desbloqueada durante ${minutes} minutos (todos los proyectos y ambientes). Para limitarla: kofre unlock --env dev`);
+      return;
+    }
+    const { envCacheKey } = await import("./secrets");
+    const { readEnvKeys, writeEnvKeys } = await import("./vault-store");
+    const project = await loadProject();
+    const privateKey = await vaultKey({ persist: false });
+    const keys = readEnvKeys();
+    const slugs = opts.env.split(",").map((slug) => slug.trim()).filter(Boolean);
+    for (const slug of slugs) {
+      const environment = project.environments.find((env) => env.slug === slug);
+      if (!environment) throw new Error(`No existe el ambiente ${slug}`);
+      const wrap = environment.keyWraps[0]?.ciphertext;
+      if (!wrap) throw new Error(`No tienes la clave del ambiente ${slug}.`);
+      keys[envCacheKey(project.id, slug)] = bytesToB64(openSealedEnvKey(wrap, privateKey, { projectId: project.id, slug }));
+    }
+    writeEnvKeys(keys);
+    console.log(`Desbloqueado ${slugs.join(", ")} de ${project.name} durante ${minutes} minutos. La clave privada no se guardó: el resto de ambientes sigue bloqueado.`);
   });
 
 program
@@ -101,6 +125,28 @@ program
     console.log("Listo. Los agentes usan las variables con la herramienta kofre_run; ejecuta `kofre unlock` antes de empezar.");
   });
 
+/** Mi propia entrada en la lista de miembros, con la clave pública derivada de mi clave privada (no la que diga el servidor). */
+function selfOf(members: { userId: string; email: string }[], email: string, privateKey: Uint8Array) {
+  const me = members.find((member) => member.email === email);
+  return me ? { userId: me.userId, publicKey: bytesToB64(publicKeyOf(privateKey)) } : undefined;
+}
+
+/** Id de proyecto generado en el cliente (32 hex): la API lo acepta tal cual si está libre. */
+const newProjectId = () => randomUUID().replaceAll("-", "");
+
+const keys = program.command("keys").description("Claves públicas confiadas de miembros y tokens (se fijan la primera vez que las confirmas)");
+keys.command("list").action(() => {
+  printTable(["TIPO", "ID", "HUELLA"], listKeys().map((row) => [row.kind === "user" ? "usuario" : "token", row.id, row.fingerprint]), "Todavía no has confirmado ninguna clave.");
+});
+keys
+  .command("forget")
+  .description("Olvida una clave fijada; la próxima vez que aparezca se volverá a pedir confirmación")
+  .argument("<id>", "id de usuario o de token")
+  .action((id: string) => {
+    const had = forgetKey("user", id) || forgetKey("token", id);
+    console.log(had ? "Clave olvidada." : "No había ninguna clave fijada con ese id.");
+  });
+
 const projects = program.command("projects").description("Proyectos");
 
 projects.command("list").action(async () => {
@@ -120,14 +166,16 @@ projects
   .action(async (opts: { name: string; envs: string }) => {
     const session = requireSession();
     const publicKey = b64ToBytes(session.publicKey);
+    // El id lo genera el cliente: así la clave de cada ambiente queda ligada al proyecto desde el primer sellado.
+    const id = newProjectId();
     const environments = opts.envs
       .split(",")
       .map((slug) => slug.trim())
       .filter(Boolean)
-      .map((slug) => ({ slug, keyWrap: sealEnvKeyForUser(generateEnvKey(), publicKey) }));
+      .map((slug) => ({ slug, keyWrap: sealEnvKeyForUser(generateEnvKey(), publicKey, { projectId: id, slug }) }));
     const created = await api<ProjectRow>(
       "/projects",
-      { method: "POST", body: JSON.stringify({ name: opts.name, environments }) },
+      { method: "POST", body: JSON.stringify({ id, name: opts.name, environments }) },
       session.token,
     );
     console.log(created.id);
@@ -196,13 +244,16 @@ envs
   .description("Crea un ambiente con una clave nueva sellada para tu cuenta")
   .argument("<slug>", "slug en minúsculas, por ejemplo qa")
   .option("--name <name>", "nombre legible")
-  .action(async (slug: string, opts: { name?: string }) => {
+  .option("--yes", "aceptar claves públicas aún no confirmadas sin preguntar una a una")
+  .action(async (slug: string, opts: { name?: string; yes?: boolean }) => {
     const session = requireSession();
     const project = await loadProject();
     const members = await listMembers(project.id, session.token);
+    const privateKey = await vaultKey();
+    await verifyPrincipals(memberPrincipals(members), { self: selfOf(members, session.email, privateKey), trustNew: opts.yes });
     const created = await api<EnvironmentRow>(
       `/projects/${project.id}/environments`,
-      { method: "POST", body: JSON.stringify({ slug, name: opts.name, keyWraps: wrapsForMembers(generateEnvKey(), members) }) },
+      { method: "POST", body: JSON.stringify({ slug, name: opts.name, keyWraps: wrapsForMembers(generateEnvKey(), members, { projectId: project.id, slug }) }) },
       session.token,
     );
     console.log(`${created.slug}\t${created.id}`);
@@ -236,17 +287,15 @@ members
     const session = requireSession();
     const project = await loadProject();
     const user = await api<{ id: string; email: string; publicKey: string }>(`/users/lookup?email=${encodeURIComponent(email)}`, {}, session.token);
-    const print = fingerprint(b64ToBytes(user.publicKey));
-    console.log(`${user.email}\nHuella: ${print}`);
-    if (!opts.yes) {
-      const answer = await promptHidden("Confirma la huella con esa persona por otro canal y escribe 'si'");
-      if (answer.trim().toLowerCase() !== "si") throw new Error("Cancelado.");
-    }
+    console.log(`${user.email}\nHuella: ${fingerprint(b64ToBytes(user.publicKey))}`);
+    // Confirmada la huella, la clave queda fijada: en rotaciones futuras tiene que seguir siendo esta.
+    await verifyPrincipals([{ kind: "user", id: user.id, label: user.email, publicKey: user.publicKey }], { trustNew: opts.yes });
     const privateKey = await vaultKey();
     const keyWraps = project.environments.map((env) => {
       const wrap = env.keyWraps[0]?.ciphertext;
       if (!wrap) throw new Error(`No tienes la clave del ambiente ${env.slug}.`);
-      return { environmentId: env.id, keyWrap: sealEnvKeyForUser(openSealedEnvKey(wrap, privateKey), b64ToBytes(user.publicKey)) };
+      const scope = { projectId: project.id, slug: env.slug };
+      return { environmentId: env.id, keyWrap: sealEnvKeyForUser(openSealedEnvKey(wrap, privateKey, scope), b64ToBytes(user.publicKey), scope) };
     });
     await api(`/projects/${project.id}/members`, { method: "POST", body: JSON.stringify({ userId: user.id, role: opts.role, keyWraps }) }, session.token);
     console.log(`${user.email} añadido como ${opts.role}.`);
@@ -256,7 +305,8 @@ members
   .command("remove")
   .description("Quita a un miembro y rota las claves de cifrado de todos los ambientes")
   .argument("<email>")
-  .action(async (email: string) => {
+  .option("--yes", "aceptar claves públicas aún no confirmadas sin preguntar una a una")
+  .action(async (email: string, opts: { yes?: boolean }) => {
     const session = requireSession();
     const project = await loadProject();
     const all = await listMembers(project.id, session.token);
@@ -264,9 +314,10 @@ members
     if (!target) throw new Error("Esa cuenta no es miembro del proyecto.");
     const keep = all.filter((member) => member.userId !== target.userId);
     const privateKey = await vaultKey();
+    const self = selfOf(all, session.email, privateKey);
     const seen = new Set<string>();
     for (const env of project.environments) {
-      for (const name of await rotateEnvironment(project.id, env, privateKey, keep, session.token)) seen.add(`${env.slug}/${name}`);
+      for (const name of await rotateEnvironment(project.id, env, privateKey, keep, session.token, { self, trustNew: opts.yes })) seen.add(`${env.slug}/${name}`);
     }
     await api(`/projects/${project.id}/members/${target.userId}`, { method: "DELETE" }, session.token);
     console.log(`${target.email} ya no tiene acceso. Claves de cifrado rotadas en ${project.environments.length} ambiente(s).`);
@@ -311,7 +362,8 @@ tokens
       if (!env) throw new Error(`No existe el ambiente ${slug}`);
       const wrap = env.keyWraps[0]?.ciphertext;
       if (!wrap) throw new Error(`No tienes la clave del ambiente ${slug}.`);
-      return { environmentId: env.id, keyWrap: sealEnvKeyForUser(openSealedEnvKey(wrap, privateKey), b64ToBytes(material.publicKey)) };
+      const scope = { projectId: project.id, slug };
+      return { environmentId: env.id, keyWrap: sealEnvKeyForUser(openSealedEnvKey(wrap, privateKey, scope), b64ToBytes(material.publicKey), scope) };
     });
     const created = await api<{ id: string }>(
       `/projects/${project.id}/tokens`,
@@ -327,6 +379,7 @@ tokens
       },
       session.token,
     );
+    pinKey("token", created.id, material.publicKey);
     console.error("Guarda este token ahora; no se puede volver a ver. Úsalo como KOFRE_TOKEN en tu CI (solo lectura).");
     console.log(formatServiceToken(created.id, material.secret));
   });
@@ -376,7 +429,7 @@ program
       {},
       session.token,
     );
-    const key = opts.show ? await envKeyFor(environment) : null;
+    const key = opts.show ? await envKeyFor(environment, project.id) : null;
     printTable(
       ["VERSIÓN", "FECHA", "VALOR"],
       versions.map((entry) => [
@@ -475,7 +528,7 @@ program
       throw new Error("Indica un comando después de --. Para exportar un .env: kofre pull --env dev -o .env");
     }
     const { values: secrets } = await readSecrets(opts.env);
-    const env = { ...process.env, ...secrets };
+    const env = { ...process.env, ...Object.fromEntries(Object.entries(secrets).filter(([key]) => !isReservedName(key))) };
     // Con cmd.exe se pasa una sola línea ya entrecomillada: Node concatena los argumentos igual (y avisa con DEP0190).
     const child = needsCmdShell(command[0])
       ? spawn(command.map(quoteForCmd).join(" "), { stdio: "inherit", shell: true, env })

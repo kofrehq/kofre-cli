@@ -17,6 +17,8 @@ function cacheDir(): string {
 }
 
 function cachePath(projectId: string, slug: string): string {
+  // Los dos vienen del servidor: solo caracteres de id y slug, nunca una ruta.
+  if (!/^[a-z0-9]{1,40}$/i.test(projectId) || !/^[a-z0-9][a-z0-9-]{0,31}$/.test(slug)) throw new Error("Nombre de proyecto o ambiente no válido para la caché");
   return join(cacheDir(), `${projectId}-${slug}.json`);
 }
 

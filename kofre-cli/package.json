@@ -1,6 +1,6 @@
 {
   "name": "@kofre/cli",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "Secretos de proyecto cifrados en tu máquina. kofre push / pull sobre archivos .env.",
   "license": "MIT",
   "repository": {

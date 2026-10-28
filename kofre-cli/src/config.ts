@@ -30,8 +30,12 @@ function home(): string {
 
 const sessionPath = () => join(home(), "session.json");
 
+/** La sesión se emitió para una API concreta: el token nunca viaja a otro host aunque KOFRE_API_URL diga lo contrario (p. ej. un .mcp.json ajeno). */
 export function apiUrl(): string {
-  return process.env.KOFRE_API_URL ?? readSession()?.apiUrl ?? "https://kofre-api.fly.dev";
+  const session = readSession()?.apiUrl;
+  const fromEnv = process.env.KOFRE_API_URL;
+  if (session && fromEnv && fromEnv !== session) console.error(`[kofre] KOFRE_API_URL (${fromEnv}) no coincide con la sesión (${session}); se usa la sesión. Haz kofre logout y login para cambiar de API.`);
+  return session ?? fromEnv ?? "https://kofre-api.fly.dev";
 }
 
 export function readSession(): SessionFile | null {
@@ -78,7 +82,11 @@ export function requireSession(): SessionFile {
 }
 
 /** Clave privada: del token de servicio, del llavero del SO si sigue vigente, o pidiendo la contraseña maestra. */
-export async function vaultKey(): Promise<Uint8Array> {
+/**
+ * Clave privada de la cuenta. Solo `kofre unlock` la deja en el llavero (persist); un `kofre pull` que pide contraseña la
+ * usa y la olvida, para que no quede 12 horas al alcance de cualquier proceso sin que el usuario lo haya pedido.
+ */
+export async function vaultKey(opts: { persist?: boolean } = {}): Promise<Uint8Array> {
   const token = serviceToken();
   if (token) return serviceTokenKeys(parseServiceToken(token).secret).privateKey;
   const cached = readVaultKey();
@@ -91,7 +99,7 @@ export async function vaultKey(): Promise<Uint8Array> {
   } catch {
     throw new Error("Contraseña maestra incorrecta.");
   }
-  writeVaultKey(bytesToB64(unlocked.privateKey));
+  if (opts.persist) writeVaultKey(bytesToB64(unlocked.privateKey));
   return unlocked.privateKey;
 }
 

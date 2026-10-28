@@ -16,6 +16,8 @@ import {
   parseRecoveryKey,
   recoveryVerifier,
   sealEnvKeyForUser,
+  isLegacyEnvKeyWrap,
+  publicKeyOf,
   unlockAccount,
   unlockWithRecoveryKey,
   unwrapPrivateKey,
@@ -213,5 +215,25 @@ describe("secretos", () => {
     for (const value of ["", "ñandú 🔐", "line1\nline2\r\n", "a".repeat(20000)]) {
       expect(decryptSecret(envKey, encryptSecret(envKey, value, meta), meta)).toBe(value);
     }
+  });
+});
+
+describe("clave de ambiente ligada al proyecto y al ambiente", () => {
+  it("el formato 2 solo abre con el mismo proyecto y slug; el formato 1 sigue abriendo sin ámbito", () => {
+    const priv = new Uint8Array(32).map((_, i) => i + 1);
+    const pub = publicKeyOf(priv);
+    const envKey = generateEnvKey();
+    const scope = { projectId: "p1", slug: "prod" };
+    const sealed = sealEnvKeyForUser(envKey, pub, scope);
+    expect(isLegacyEnvKeyWrap(sealed)).toBe(false);
+    expect(Buffer.from(openSealedEnvKey(sealed, priv, scope)).equals(Buffer.from(envKey))).toBe(true);
+    expect(() => openSealedEnvKey(sealed, priv, { projectId: "p1", slug: "dev" })).toThrow();
+    expect(() => openSealedEnvKey(sealed, priv, { projectId: "p2", slug: "prod" })).toThrow();
+    expect(() => openSealedEnvKey(sealed, priv)).toThrow(/ámbito/);
+    const legacy = sealEnvKeyForUser(envKey, pub);
+    expect(isLegacyEnvKeyWrap(legacy)).toBe(true);
+    expect(Buffer.from(openSealedEnvKey(legacy, priv, scope)).equals(Buffer.from(envKey))).toBe(true);
+    // Clave pública de orden bajo (todo ceros): se rechaza en vez de derivar una clave predecible.
+    expect(() => sealEnvKeyForUser(envKey, new Uint8Array(32), scope)).toThrow();
   });
 });

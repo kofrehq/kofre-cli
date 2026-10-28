@@ -5,10 +5,17 @@ import { join } from "node:path";
 // ponytail: llavero del SO vía herramientas nativas (DPAPI, security, secret-tool) para mantener la CLI en un solo
 // archivo sin addons nativos. Si Node SEA llega a empaquetar addons, @napi-rs/keyring es el reemplazo directo.
 
-type Payload = { key: string; exp: number };
+/*
+ * Dos entradas en el llavero, con caducidad:
+ *  - "vault": la clave privada de la cuenta (kofre unlock). Abre cualquier ambiente de cualquier proyecto.
+ *  - "envkeys": claves de ambientes concretos (kofre unlock --env dev). La clave privada no se guarda; un agente con
+ *    esta entrada solo alcanza esos ambientes, nunca prod si no se desbloqueó.
+ */
+
+type Payload = { key?: string; keys?: Record<string, string>; exp: number };
+type Account = "vault" | "envkeys";
 
 const SERVICE = "kofre";
-const ACCOUNT = "vault";
 
 function home(): string {
   return process.env.KOFRE_HOME ?? join(process.env.USERPROFILE ?? process.env.HOME ?? ".", ".kofre");
@@ -23,8 +30,8 @@ function useFileBackend(): boolean {
   return process.env.KOFRE_VAULT_FILE === "1";
 }
 
-const filePath = () => join(home(), "vault.key");
-const dpapiPath = () => join(home(), "vault.dpapi");
+const filePath = (account: Account) => join(home(), account === "vault" ? "vault.key" : "envkeys.key");
+const dpapiPath = (account: Account) => join(home(), account === "vault" ? "vault.dpapi" : "envkeys.dpapi");
 
 function writeOwnerOnly(path: string, data: string) {
   mkdirSync(home(), { recursive: true });
@@ -53,55 +60,56 @@ const PS_UNPROTECT =
   "[Text.Encoding]::UTF8.GetString([Security.Cryptography.ProtectedData]::Unprotect([Convert]::FromBase64String($in),$null,'CurrentUser'))";
 
 type Backend = {
-  read(): string | null;
-  write(data: string): void;
-  clear(): void;
+  read(account: Account): string | null;
+  write(account: Account, data: string): void;
+  clear(account: Account): void;
 };
 
 const fileBackend: Backend = {
-  read: () => (existsSync(filePath()) ? readFileSync(filePath(), "utf8") : null),
-  write: (data) => writeOwnerOnly(filePath(), data),
-  clear: () => rmSync(filePath(), { force: true }),
+  read: (account) => (existsSync(filePath(account)) ? readFileSync(filePath(account), "utf8") : null),
+  write: (account, data) => writeOwnerOnly(filePath(account), data),
+  clear: (account) => rmSync(filePath(account), { force: true }),
 };
 
 const dpapiBackend: Backend = {
-  read: () => (existsSync(dpapiPath()) ? powershell(PS_UNPROTECT, readFileSync(dpapiPath(), "utf8")) : null),
-  write: (data) => writeOwnerOnly(dpapiPath(), powershell(PS_PROTECT, data)),
-  clear: () => rmSync(dpapiPath(), { force: true }),
+  read: (account) => (existsSync(dpapiPath(account)) ? powershell(PS_UNPROTECT, readFileSync(dpapiPath(account), "utf8")) : null),
+  write: (account, data) => writeOwnerOnly(dpapiPath(account), powershell(PS_PROTECT, data)),
+  clear: (account) => rmSync(dpapiPath(account), { force: true }),
 };
 
 const keychainBackend: Backend = {
-  read: () => {
-    const result = spawnSync("security", ["find-generic-password", "-a", ACCOUNT, "-s", SERVICE, "-w"], { encoding: "utf8" });
-    return result.status === 0 ? result.stdout.trim() : null;
+  read: (account) => {
+    const result = spawnSync("security", ["find-generic-password", "-a", account, "-s", SERVICE, "-w"], { encoding: "utf8" });
+    // El payload va en base64: `security -i` tokeniza la línea y las comillas del JSON no sobrevivirían.
+    return result.status === 0 ? Buffer.from(result.stdout.trim(), "base64").toString("utf8") : null;
   },
   // `security -i` lee comandos por stdin: el secreto no pasa por argv.
-  write: (data) => {
+  write: (account, data) => {
     const result = spawnSync("security", ["-i"], {
-      input: `add-generic-password -U -a ${ACCOUNT} -s ${SERVICE} -w ${data}\n`,
+      input: `add-generic-password -U -a ${account} -s ${SERVICE} -w ${Buffer.from(data, "utf8").toString("base64")}\n`,
       encoding: "utf8",
     });
     if (result.status !== 0) throw new Error(result.stderr || "No se pudo guardar en el llavero");
   },
-  clear: () => {
-    spawnSync("security", ["delete-generic-password", "-a", ACCOUNT, "-s", SERVICE], { stdio: "ignore" });
+  clear: (account) => {
+    spawnSync("security", ["delete-generic-password", "-a", account, "-s", SERVICE], { stdio: "ignore" });
   },
 };
 
 const secretToolBackend: Backend = {
-  read: () => {
-    const result = spawnSync("secret-tool", ["lookup", "service", SERVICE, "account", ACCOUNT], { encoding: "utf8" });
+  read: (account) => {
+    const result = spawnSync("secret-tool", ["lookup", "service", SERVICE, "account", account], { encoding: "utf8" });
     return result.status === 0 && result.stdout ? result.stdout.trim() : null;
   },
-  write: (data) => {
-    const result = spawnSync("secret-tool", ["store", "--label=Kofre vault", "service", SERVICE, "account", ACCOUNT], {
+  write: (account, data) => {
+    const result = spawnSync("secret-tool", ["store", "--label=Kofre vault", "service", SERVICE, "account", account], {
       input: data,
       encoding: "utf8",
     });
     if (result.status !== 0) throw new Error(result.stderr || "No se pudo guardar en el llavero");
   },
-  clear: () => {
-    spawnSync("secret-tool", ["clear", "service", SERVICE, "account", ACCOUNT], { stdio: "ignore" });
+  clear: (account) => {
+    spawnSync("secret-tool", ["clear", "service", SERVICE, "account", account], { stdio: "ignore" });
   },
 };
 
@@ -119,36 +127,61 @@ function backend(): Backend {
   return fileBackend;
 }
 
-export function readVaultKey(): string | null {
+function readPayload(account: Account): Payload | null {
   let raw: string | null;
   try {
-    raw = backend().read();
+    raw = backend().read(account);
   } catch {
     return null;
   }
   if (!raw) return null;
   try {
     const payload = JSON.parse(raw) as Payload;
-    if (!payload.key || payload.exp <= Date.now()) {
-      clearVaultKey();
+    if (payload.exp <= Date.now()) {
+      clear(account);
       return null;
     }
-    return payload.key;
+    return payload;
   } catch {
-    clearVaultKey();
+    clear(account);
     return null;
   }
 }
 
-export function writeVaultKey(keyB64: string) {
-  const payload: Payload = { key: keyB64, exp: Date.now() + ttlMs() };
-  backend().write(JSON.stringify(payload));
-}
-
-export function clearVaultKey() {
+function clear(account: Account) {
   try {
-    backend().clear();
+    backend().clear(account);
   } catch {
     // Nada que limpiar.
   }
+}
+
+/** Clave privada de la cuenta en base64, si está desbloqueada y no ha caducado. */
+export function readVaultKey(): string | null {
+  return readPayload("vault")?.key ?? null;
+}
+
+export function writeVaultKey(keyB64: string) {
+  backend().write("vault", JSON.stringify({ key: keyB64, exp: Date.now() + ttlMs() } satisfies Payload));
+}
+
+/** Claves de ambiente desbloqueadas a propósito: { "<projectId>:<slug>": envKey base64 }. */
+export function readEnvKeys(): Record<string, string> {
+  return readPayload("envkeys")?.keys ?? {};
+}
+
+export function writeEnvKeys(keys: Record<string, string>) {
+  backend().write("envkeys", JSON.stringify({ keys, exp: Date.now() + ttlMs() } satisfies Payload));
+}
+
+/** `kofre lock` y `kofre logout`: olvida la clave privada y las claves de ambiente. */
+export function clearVaultKey() {
+  clear("vault");
+  clear("envkeys");
+}
+
+/** Cuándo caduca lo que haya desbloqueado, para decírselo al usuario. */
+export function vaultExpiry(): Date | null {
+  const exp = readPayload("vault")?.exp ?? readPayload("envkeys")?.exp;
+  return exp ? new Date(exp) : null;
 }
