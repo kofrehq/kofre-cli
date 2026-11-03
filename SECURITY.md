@@ -1,6 +1,6 @@
 # Seguridad
 
-Si encuentras una vulnerabilidad en la CLI, en `@kofre/crypto` o en el servicio, escribe a **security@kofre.io** con los pasos para reproducirla. No abras un issue público hasta que haya corrección.
+Si encuentras una vulnerabilidad en la CLI, en `@kofre/crypto` o en el servicio, escribe a **hola@kofre.cloud** (asunto: "Seguridad") con los pasos para reproducirla. No abras un issue público hasta que haya corrección.
 
 Respondemos en 72 horas y publicamos la corrección con una nota en la release. Las versiones con soporte son la última de `@kofre/cli` en npm y la release más reciente de binarios.
 
