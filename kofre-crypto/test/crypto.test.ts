@@ -44,8 +44,9 @@ const VECTORS = {
   fingerprint: "8c0c c17a 0494 2cc4",
 };
 
-const hex = (bytes: Uint8Array) => Buffer.from(bytes).toString("hex");
-const same = (a: Uint8Array, b: Uint8Array) => Buffer.from(a).equals(Buffer.from(b));
+// Solo APIs estándar: @kofre/crypto corre en el navegador y sus tests no cargan tipos de Node.
+const hex = (bytes: Uint8Array) => Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+const same = (a: Uint8Array, b: Uint8Array) => hex(a) === hex(b);
 
 function flipByte(blob: string, index: number): string {
   const raw = b64ToBytes(blob);
@@ -226,13 +227,13 @@ describe("clave de ambiente ligada al proyecto y al ambiente", () => {
     const scope = { projectId: "p1", slug: "prod" };
     const sealed = sealEnvKeyForUser(envKey, pub, scope);
     expect(isLegacyEnvKeyWrap(sealed)).toBe(false);
-    expect(Buffer.from(openSealedEnvKey(sealed, priv, scope)).equals(Buffer.from(envKey))).toBe(true);
+    expect(same(openSealedEnvKey(sealed, priv, scope), envKey)).toBe(true);
     expect(() => openSealedEnvKey(sealed, priv, { projectId: "p1", slug: "dev" })).toThrow();
     expect(() => openSealedEnvKey(sealed, priv, { projectId: "p2", slug: "prod" })).toThrow();
     expect(() => openSealedEnvKey(sealed, priv)).toThrow(/ámbito/);
     const legacy = sealEnvKeyForUser(envKey, pub);
     expect(isLegacyEnvKeyWrap(legacy)).toBe(true);
-    expect(Buffer.from(openSealedEnvKey(legacy, priv, scope)).equals(Buffer.from(envKey))).toBe(true);
+    expect(same(openSealedEnvKey(legacy, priv, scope), envKey)).toBe(true);
     // Clave pública de orden bajo (todo ceros): se rechaza en vez de derivar una clave predecible.
     expect(() => sealEnvKeyForUser(envKey, new Uint8Array(32), scope)).toThrow();
   });
