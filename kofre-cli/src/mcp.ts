@@ -1,9 +1,9 @@
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-import { serviceToken } from "./config";
-import { MAX_VALUE_BYTES, SECRET_NAME, isReservedName, readTomlProject } from "./envfile";
+import { agentToken, serviceToken } from "./config";
+import { MAX_VALUE_BYTES, SECRET_NAME, isReservedName } from "./envfile";
 import { DETACH_FOR_TREE_KILL, killTree } from "./kill-tree";
-import { envCacheKey, loadProject, readSecrets, writeSecrets } from "./secrets";
+import { envCacheKey, linkedProject, listNames, loadProject, readSecrets, writeSecrets } from "./secrets";
 import { readEnvKeys, readVaultKey } from "./vault-store";
 import { needsCmdShell, quoteForCmd } from "./win-command";
 
@@ -69,9 +69,9 @@ type ToolName = (typeof TOOLS)[number]["name"];
 const unlocked = () => Boolean(serviceToken() || readVaultKey() || Object.keys(readEnvKeys()).length);
 
 /** Con `kofre unlock --env dev` solo ese ambiente está abierto: prod sigue bloqueado para el agente aunque lo pida. */
-function requireUnlocked(slug?: string) {
+async function requireUnlocked(slug?: string) {
   if (serviceToken() || readVaultKey()) return;
-  const linked = readTomlProject();
+  const linked = await linkedProject();
   const chosen = slug ?? linked?.defaultEnv ?? "dev";
   if (linked && readEnvKeys()[envCacheKey(linked.projectId, chosen)]) return;
   throw new Error(
@@ -138,27 +138,31 @@ async function runWithSecrets(command: string[], slug: string | undefined, timeo
 export async function callTool(name: ToolName | string, args: Json): Promise<string> {
   switch (name) {
     case "kofre_status": {
-      const linked = readTomlProject();
-      if (!linked) return "Esta carpeta no está vinculada a ningún proyecto. Pide al usuario que ejecute `kofre init --project <id>`.";
+      const linked = await linkedProject();
+      if (!linked) {
+        return agentToken()
+          ? "El token de agente incluye varios proyectos y esta carpeta no está vinculada. Pide al usuario que ejecute `kofre init --project <id>`."
+          : "Esta carpeta no está vinculada a ningún proyecto. Pide al usuario que ejecute `kofre init --project <id>`.";
+      }
       const project = await loadProject();
       const envs = project.environments.map((env) => `  - ${env.slug}${env.slug === linked.defaultEnv ? " (por defecto)" : ""}`).join("\n");
-      return `proyecto: ${project.name} (${project.id})\nbóveda: ${unlocked() ? "desbloqueada" : "bloqueada (kofre unlock)"}\nambientes:\n${envs}`;
+      const auth = agentToken() ? "token de agente" : serviceToken() ? "token de servicio" : "sesión";
+      return `proyecto: ${project.name} (${project.id})\nacceso: ${auth}\nbóveda: ${unlocked() ? "desbloqueada" : "bloqueada (kofre unlock --env <ambiente>)"}\nambientes:\n${envs}`;
     }
     case "kofre_list": {
-      requireUnlocked(typeof args.env === "string" ? args.env : undefined);
-      const { environment, values } = await readSecrets(typeof args.env === "string" ? args.env : undefined);
-      const names = Object.keys(values).sort();
+      // Los nombres viajan en claro: listar no necesita la bóveda abierta.
+      const { environment, names } = await listNames(typeof args.env === "string" ? args.env : undefined);
       return names.length ? `${environment.slug}: ${names.length} variables\n${names.join("\n")}` : `${environment.slug}: sin variables`;
     }
     case "kofre_run": {
-      requireUnlocked(typeof args.env === "string" ? args.env : undefined);
+      await requireUnlocked(typeof args.env === "string" ? args.env : undefined);
       const command = Array.isArray(args.command) ? args.command.map(String) : [];
       if (command.length === 0) throw new Error("command debe ser un array con al menos el programa.");
       const timeout = typeof args.timeout_ms === "number" && args.timeout_ms > 0 ? Math.min(args.timeout_ms, MAX_TIMEOUT_MS) : DEFAULT_TIMEOUT_MS;
       return runWithSecrets(command, typeof args.env === "string" ? args.env : undefined, timeout);
     }
     case "kofre_set": {
-      requireUnlocked(typeof args.env === "string" ? args.env : undefined);
+      await requireUnlocked(typeof args.env === "string" ? args.env : undefined);
       const key = String(args.name ?? "");
       const value = String(args.value ?? "");
       if (!SECRET_NAME.test(key)) throw new Error(`Nombre no válido: ${key}. Usa letras, dígitos y guion bajo.`);

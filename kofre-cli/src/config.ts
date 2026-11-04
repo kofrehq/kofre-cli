@@ -63,18 +63,33 @@ export function clearSession() {
   clearVaultKey();
 }
 
+const AGENT_PREFIX = "kofre_mcp_";
+
 /** KOFRE_TOKEN (kofre_st_…) sustituye al login: acceso de solo lectura para CI, sin llavero ni contraseña. */
 export function serviceToken(): string | null {
   const token = process.env.KOFRE_TOKEN?.trim();
-  if (!token) return null;
-  if (!isServiceToken(token)) throw new Error("KOFRE_TOKEN no tiene el formato kofre_st_<id>.<secreto>.");
+  if (!token || token.startsWith(AGENT_PREFIX)) return null;
+  if (!isServiceToken(token)) throw new Error("KOFRE_TOKEN no tiene el formato kofre_st_<id>.<secreto> ni kofre_mcp_<id>.<secreto>.");
   return token;
+}
+
+/**
+ * KOFRE_TOKEN (kofre_mcp_…) es un token para agentes: sustituye a `kofre login` (identifica a la persona, limitado a
+ * los proyectos y ambientes del token) pero no descifra nada. La clave sigue en el llavero del equipo (kofre unlock).
+ */
+export function agentToken(): string | null {
+  const token = process.env.KOFRE_TOKEN?.trim();
+  return token?.startsWith(AGENT_PREFIX) ? token : null;
 }
 
 export function requireSession(): SessionFile {
   const token = serviceToken();
   if (token) {
     return { apiUrl: apiUrl(), token, email: "token de servicio", salt: "", kdfParams: DEFAULT_KDF, wrappedPrivateKey: "", publicKey: "" };
+  }
+  const agent = agentToken();
+  if (agent) {
+    return { apiUrl: apiUrl(), token: agent, email: "token de agente", salt: "", kdfParams: DEFAULT_KDF, wrappedPrivateKey: "", publicKey: "" };
   }
   const session = readSession();
   if (!session) throw new Error("No hay sesión. Ejecuta `kofre login` o define KOFRE_TOKEN.");
@@ -92,10 +107,14 @@ export async function vaultKey(opts: { persist?: boolean } = {}): Promise<Uint8A
   const cached = readVaultKey();
   if (cached) return b64ToBytes(cached);
   const session = requireSession();
+  // Con token de agente no hay sesión local con la clave cifrada: se pide a /auth/me (cifrada; sin la contraseña no sirve).
+  const material = agentToken()
+    ? await api<{ salt: string; kdfParams: KdfParams; wrappedPrivateKey: string }>("/auth/me", {}, session.token)
+    : session;
   const password = await promptHidden("Contraseña maestra");
   let unlocked;
   try {
-    unlocked = await unlockAccount(password, session.salt, session.wrappedPrivateKey, session.kdfParams);
+    unlocked = await unlockAccount(password, material.salt, material.wrappedPrivateKey, material.kdfParams);
   } catch {
     throw new Error("Contraseña maestra incorrecta.");
   }

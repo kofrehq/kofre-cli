@@ -1,5 +1,5 @@
 import { b64ToBytes, decryptSecret, encryptSecret, openSealedEnvKey } from "@kofre/crypto";
-import { ApiError, api, requireSession, serviceToken, vaultKey } from "./config";
+import { ApiError, agentToken, api, requireSession, serviceToken, vaultKey } from "./config";
 import { readEnvKeys, readVaultKey } from "./vault-store";
 import { readTomlProject } from "./envfile";
 import { isNetworkError, readCache, saveCache } from "./offline";
@@ -23,15 +23,43 @@ export type SecretRow = {
   ciphertext: string;
   version: number;
 };
-export async function loadProject(): Promise<ProjectRow> {
+/**
+ * Proyecto de la carpeta (.kofre.toml). Sin él, con un token de agente de un solo proyecto, ese proyecto: el agente
+ * funciona en cualquier carpeta. Ambiente por defecto: KOFRE_ENV, el del .kofre.toml, o dev si el token lo incluye.
+ */
+export async function linkedProject(): Promise<{ projectId: string; defaultEnv: string } | null> {
   const linked = readTomlProject();
-  if (!linked) throw new Error("No hay .kofre.toml. Ejecuta `kofre init --project <id>`.");
+  const env = process.env.KOFRE_ENV?.trim();
+  if (linked) return env ? { ...linked, defaultEnv: env } : linked;
+  if (!agentToken()) return null;
+  const projects = await api<{ id: string; environments: { slug: string }[] }[]>("/projects", {}, requireSession().token);
+  if (projects.length !== 1) return null;
+  const slugs = projects[0].environments.map((e) => e.slug);
+  return { projectId: projects[0].id, defaultEnv: env ?? (slugs.includes("dev") ? "dev" : (slugs[0] ?? "dev")) };
+}
+
+export async function loadProject(): Promise<ProjectRow> {
+  const linked = await linkedProject();
+  if (!linked) {
+    throw new Error(
+      agentToken()
+        ? "El token de agente incluye varios proyectos: vincula la carpeta con `kofre init --project <id>`."
+        : "No hay .kofre.toml. Ejecuta `kofre init --project <id>`.",
+    );
+  }
   const session = requireSession();
   return api<ProjectRow>(`/projects/${linked.projectId}`, {}, session.token);
 }
 
+/** Solo nombres (no están cifrados): no hace falta la bóveda abierta. */
+export async function listNames(slug?: string): Promise<{ environment: EnvironmentRow; names: string[] }> {
+  const { environment } = await environmentFor(slug);
+  const rows = await api<SecretRow[]>(`/environments/${environment.id}/secrets`, {}, requireSession().token);
+  return { environment, names: rows.map((row) => row.name).sort() };
+}
+
 export async function environmentFor(slug?: string) {
-  const linked = readTomlProject();
+  const linked = await linkedProject();
   const project = await loadProject();
   const chosen = slug ?? linked?.defaultEnv ?? "dev";
   const environment = project.environments.find((env) => env.slug === chosen);

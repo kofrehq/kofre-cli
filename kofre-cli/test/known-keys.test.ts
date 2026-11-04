@@ -52,14 +52,18 @@ describe("desbloqueo por ambiente", () => {
     try {
       writeEnvKeys({ "p1:dev": Buffer.alloc(32, 7).toString("base64") });
       expect(readVaultKey()).toBeNull(); // la clave privada no está en el llavero
-      const prod = await handle({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "kofre_list", arguments: { env: "prod" } } }, "test");
+      const run = (env?: string) => ({ jsonrpc: "2.0" as const, id: 1, method: "tools/call", params: { name: "kofre_run", arguments: { command: ["node", "-v"], ...(env ? { env } : {}) } } });
+      const prod = await handle(run("prod"), "test");
       expect(prod).toMatchObject({ result: { isError: true } });
       expect(JSON.stringify(prod)).toMatch(/kofre unlock --env prod/);
+      // Listar nombres no pasa por el candado (no están cifrados): falla después por no haber sesión, otro mensaje.
+      const names = await handle({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "kofre_list", arguments: { env: "prod" } } }, "test");
+      expect(JSON.stringify(names)).not.toMatch(/bloqueado/);
       // dev sí pasa el candado (falla después por no haber sesión, que es otro mensaje).
-      const devOpen = await handle({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "kofre_list", arguments: { env: "dev" } } }, "test");
+      const devOpen = await handle(run("dev"), "test");
       expect(JSON.stringify(devOpen)).not.toMatch(/bloqueado/);
       clearVaultKey();
-      const dev = await handle({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "kofre_list", arguments: {} } }, "test");
+      const dev = await handle(run(), "test");
       expect(JSON.stringify(dev)).toMatch(/kofre unlock --env dev/);
     } finally {
       process.chdir(previous);
