@@ -270,6 +270,31 @@ describe("CLI contra la API", () => {
     expect(kofre(["tokens", "list"]).out).toContain("\tci\trevocado\t");
   }, 120_000);
 
+  it("con un token de agente, kofre unlock abre justo los ambientes del token y run ya no pide contraseña", async (ctx) => {
+    if (!apiUp) return ctx.skip();
+    expect(kofre(["init", "--project", firstProjectId, "--env", "dev"]).code).toBe(0);
+    const response = await fetch(`${API}/agent-tokens`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+      body: JSON.stringify({ name: "agente-e2e", scopes: [{ projectId: firstProjectId, envSlugs: ["dev"] }], canWrite: false }),
+    });
+    expect(response.status).toBe(201);
+    const agent = ((await response.json()) as { token: string }).token;
+
+    // Sin sesión en este equipo: solo el token y la contraseña maestra, una vez.
+    const agentHome = mkdtempSync(join(tmpdir(), "kofre-agent-"));
+    const unlock = kofre(["unlock"], { KOFRE_TOKEN: agent, KOFRE_HOME: agentHome });
+    expect(unlock.code, unlock.err).toBe(0);
+    expect(unlock.out).toContain("Desbloqueado según el token: cli-e2e (dev)");
+
+    const asAgent = (args: string[]) => kofre(args, { KOFRE_TOKEN: agent, KOFRE_HOME: agentHome, KOFRE_PASSWORD: "" });
+    const run = asAgent(["run", "--env", "dev", "--", "node", "-e", "console.log(process.env.DB_URL)"]);
+    expect(run.code, run.err).toBe(0);
+    expect(run.out).toContain("postgres://u:p@h/db?x=1");
+    // prod no entra en el token: ni la API lo entrega ni hay clave para él.
+    expect(asAgent(["run", "--env", "prod", "--", "node", "-e", "1"]).code).toBe(1);
+  }, 120_000);
+
   it("rechaza nombres inválidos y contraseña incorrecta", (ctx) => {
     if (!apiUp) return ctx.skip();
     expect(kofre(["init", "--project", firstProjectId]).code).toBe(0);

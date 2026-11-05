@@ -12,7 +12,7 @@ import {
   publicKeyOf,
   sealEnvKeyForUser,
 } from "@kofre/crypto";
-import { ApiError, api, clearSession, readSession, requireSession, revokeSession, serviceToken, vaultKey } from "./config";
+import { ApiError, agentToken, api, clearSession, readSession, requireSession, revokeSession, serviceToken, vaultKey } from "./config";
 import { loginWithBrowser } from "./cli-login";
 import { MAX_VALUE_BYTES, SECRET_NAME, gitignoreWarns, kofreHeader, parseEnvFile, readTomlProject, serializeEnv, tomlFor, isReservedName } from "./envfile";
 import { choosePullTarget } from "./pull-target";
@@ -71,10 +71,36 @@ program
 
 program
   .command("unlock")
-  .description("Pide la contraseña maestra y deja la clave en el llavero; así `kofre mcp` y los agentes no la necesitan")
+  .description("Pide la contraseña maestra y deja la clave en el llavero; así `kofre mcp` y los agentes no la necesitan. Con un KOFRE_TOKEN de agente abre solo los ambientes del token")
   .option("--env <slugs>", "solo estos ambientes del proyecto vinculado (separados por coma): la clave privada no se guarda y un agente no alcanza los demás, por ejemplo prod")
   .action(async (opts: { env?: string }) => {
     const minutes = process.env.KOFRE_VAULT_TTL_MIN ?? 720;
+    // Con un token de agente, el alcance ya lo eligió la persona en la web: se abren justo esos ambientes, en todos sus
+    // proyectos. La API solo devuelve los ambientes del token, así que nada fuera de él llega a descifrarse.
+    if (!opts.env && agentToken()) {
+      const { envCacheKey } = await import("./secrets");
+      const { readEnvKeys, writeEnvKeys } = await import("./vault-store");
+      const token = requireSession().token;
+      const projects = await api<{ id: string }[]>("/projects", {}, token);
+      const privateKey = await vaultKey({ persist: false });
+      const keys = readEnvKeys();
+      const opened: string[] = [];
+      for (const { id } of projects) {
+        const project = await api<ProjectRow>(`/projects/${id}`, {}, token);
+        const slugs: string[] = [];
+        for (const environment of project.environments) {
+          const wrap = environment.keyWraps[0]?.ciphertext;
+          if (!wrap) continue;
+          keys[envCacheKey(project.id, environment.slug)] = bytesToB64(openSealedEnvKey(wrap, privateKey, { projectId: project.id, slug: environment.slug }));
+          slugs.push(environment.slug);
+        }
+        if (slugs.length) opened.push(`${project.name} (${slugs.join(", ")})`);
+      }
+      if (!opened.length) throw new Error("El token no alcanza ningún ambiente con clave para tu cuenta.");
+      writeEnvKeys(keys);
+      console.log(`Desbloqueado según el token: ${opened.join(" · ")} durante ${minutes} minutos. La clave privada no se guardó.`);
+      return;
+    }
     if (!opts.env) {
       await vaultKey({ persist: true });
       console.log(`Bóveda desbloqueada durante ${minutes} minutos (todos los proyectos y ambientes). Para limitarla: kofre unlock --env dev`);

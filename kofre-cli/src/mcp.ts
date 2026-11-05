@@ -74,8 +74,11 @@ async function requireUnlocked(slug?: string) {
   const linked = await linkedProject();
   const chosen = slug ?? linked?.defaultEnv ?? "dev";
   if (linked && readEnvKeys()[envCacheKey(linked.projectId, chosen)]) return;
+  // Con token de agente, `kofre unlock` ya abre justo los ambientes del token: no hace falta repetirlos.
   throw new Error(
-    `El ambiente ${chosen} está bloqueado. Pide al usuario que ejecute \`kofre unlock --env ${chosen}\` (solo ese ambiente) o \`kofre unlock\` (todos) en una terminal y vuelve a intentarlo.`,
+    agentToken()
+      ? `El ambiente ${chosen} está bloqueado. Pide al usuario que ejecute \`kofre unlock\` en una terminal (abre los ambientes de este token) y vuelve a intentarlo.`
+      : `El ambiente ${chosen} está bloqueado. Pide al usuario que ejecute \`kofre unlock --env ${chosen}\` (solo ese ambiente) o \`kofre unlock\` (todos) en una terminal y vuelve a intentarlo.`,
   );
 }
 
