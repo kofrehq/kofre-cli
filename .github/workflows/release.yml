@@ -55,7 +55,7 @@ jobs:
             asset: kofre-linux-x64
           - os: macos-15-intel
             asset: kofre-macos-x64
-          - os: macos-14
+          - os: macos-15
             asset: kofre-macos-arm64
           - os: windows-latest
             asset: kofre-windows-x64.exe
